@@ -359,6 +359,14 @@ Model checkpoints, pretrained weights, Android libraries and Python dependencies
 own licenses or usage restrictions. Users are responsible for reviewing those terms before
 redistributing an APK, converted model or hosted conversion service.
 
+## Star graph :3
+<a href="https://www.star-history.com/?repos=tuxKOH%2FGPT-SoViTs-android&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=tuxKOH/GPT-SoViTs-android&type=date&theme=dark&legend=top-left&sealed_token=eYUeD8gLl3qezgYMEj4z-DAot92KN-1IJ522V_u8s2-duF-y5ZwiNvEYncKF2GbAI0VPGd6dM30YYLBsP2FgUCJ1xNBlo61lAFJ4f9nhF_gw6t0J3SrWrw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=tuxKOH/GPT-SoViTs-android&type=date&legend=top-left&sealed_token=eYUeD8gLl3qezgYMEj4z-DAot92KN-1IJ522V_u8s2-duF-y5ZwiNvEYncKF2GbAI0VPGd6dM30YYLBsP2FgUCJ1xNBlo61lAFJ4f9nhF_gw6t0J3SrWrw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=tuxKOH/GPT-SoViTs-android&type=date&legend=top-left&sealed_token=eYUeD8gLl3qezgYMEj4z-DAot92KN-1IJ522V_u8s2-duF-y5ZwiNvEYncKF2GbAI0VPGd6dM30YYLBsP2FgUCJ1xNBlo61lAFJ4f9nhF_gw6t0J3SrWrw" />
+ </picture>
+</a>
 ## License
 
 GSV Mobile source code in this directory is licensed under the
