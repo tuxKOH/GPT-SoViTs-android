@@ -46,8 +46,8 @@ until matching-device acceptance is published.
 
 - Android 8.0 (API 26) or newer
 - 64-bit Android device
-- 16 GB physical RAM recommended
-- 8--12 GB of free process memory for large V4 workloads
+- V2 Pro Plus: minimum 8 GB physical RAM (verified)
+- V4 large workloads: allow about 8--12 GB of free process memory
 
 ### Conversion host
 

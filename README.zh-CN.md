@@ -40,8 +40,8 @@ GSV Mobile 可在 Android 本地转换并运行 [GPT-SoVITS](https://github.com/
 
 - Android 8.0（API 26）或更高版本
 - 64 位 Android 设备
-- 建议至少 16 GB 物理内存
-- 运行大型 V4 任务需约 8--12 GB 可用进程内存
+- V2 Pro Plus：最低仅需 8 GB 物理内存（已验证）
+- 大型 V4 任务：建议准备约 8--12 GB 可用进程内存
 
 ### 转换主机
 
