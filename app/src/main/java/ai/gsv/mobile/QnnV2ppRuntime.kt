@@ -990,6 +990,7 @@ object QnnV2ppRuntime {
                 val random = Random(seed.takeIf { it >= 0 } ?: System.nanoTime())
                 var logits = prefill.logits
                 var validLength = 0
+                InferenceProgressBus.begin("T2S", semanticCapacity)
                 for (iteration in 0 until semanticCapacity) {
                     // V2 Pro Plus's infer_panel_naive excludes EOS for its first 11 decoding
                     // iterations. Without this, a valid early EOS can produce unusably short audio.
@@ -1000,6 +1001,7 @@ object QnnV2ppRuntime {
                     if (token == eosToken) break
                     generated[iteration] = token
                     validLength++
+                    InferenceProgressBus.report(validLength, semanticCapacity)
                     previous.add(token)
                     if (iteration == semanticCapacity - 1) break
                     val slot = compactLength + iteration
@@ -1123,7 +1125,11 @@ object QnnV2ppRuntime {
             inputs["semantic_valid"] = TensorPayload.half(semanticValid)
             inputs["text_valid"] = TensorPayload.half(textValid)
         }
-        val raw = runGraphStages(environment, model, stages, inputs, "audio", sessions).floats()
+        InferenceProgressBus.begin("VITS", stages.size)
+        val raw = runGraphStages(
+            environment, model, stages, inputs, "audio", sessions,
+            progress = { current, total -> InferenceProgressBus.report(current, total) },
+        ).floats()
         val validSamples = (semantics.validLength * samplesPerSemantic).coerceAtMost(raw.size)
         require(validSamples > 0) { "QNN VITS returned no valid PCM samples" }
         Log.i(tag, "vits partitioned output count=${raw.size} validSamples=$validSamples")
@@ -1167,7 +1173,11 @@ object QnnV2ppRuntime {
             "reference_spectrogram" to TensorPayload.half(referenceSpectrogram),
             "speaker_embedding" to TensorPayload.half(speakerEmbedding),
         )
-        val raw = runGraphStages(environment, model, stages, inputs, "audio", sessions).floats()
+        InferenceProgressBus.begin("VITS", stages.size)
+        val raw = runGraphStages(
+            environment, model, stages, inputs, "audio", sessions,
+            progress = { current, total -> InferenceProgressBus.report(current, total) },
+        ).floats()
         val validSamples = (semantics.validLength * samplesPerSemantic).coerceAtMost(raw.size)
         require(validSamples > 0) { "QNN reference VITS returned no valid PCM samples" }
         return raw.copyOf(validSamples)
@@ -1353,13 +1363,14 @@ object QnnV2ppRuntime {
         initial: Map<String, TensorPayload>,
         outputName: String,
         sessions: GraphSessionCache? = null,
+        progress: ((Int, Int) -> Unit)? = null,
     ): TensorPayload {
         val values = HashMap(initial)
         val remainingUses = HashMap<String, Int>()
         stages.flatMap(GraphStage::inputs).forEach { input ->
             remainingUses[input.logicalName] = (remainingUses[input.logicalName] ?: 0) + 1
         }
-        stages.forEach { stage ->
+        stages.forEachIndexed { index, stage ->
             val runStage: ((OrtSession) -> Map<String, TensorPayload>) -> Map<String, TensorPayload> =
                 { block ->
                     if (sessions == null) {
@@ -1402,6 +1413,7 @@ object QnnV2ppRuntime {
                 }
             }
             values.putAll(produced)
+            progress?.invoke(index + 1, stages.size)
         }
         return requireNotNull(values[outputName]) { "partitioned QNN graph did not produce $outputName" }
     }

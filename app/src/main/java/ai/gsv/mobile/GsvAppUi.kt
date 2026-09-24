@@ -794,7 +794,23 @@ private fun LanguageChoices(label: Int, selected: String, select: (String) -> Un
 @Composable
 private fun ProgressAndStatus(state: UiState) {
     if (state.busy) {
-        if (state.downloadProgress == null) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        if (state.inferenceTotal > 0) {
+            LinearProgressIndicator(
+                progress = { (state.inferenceCurrent.toFloat() / state.inferenceTotal).coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                stringResource(
+                    R.string.inference_progress,
+                    state.inferenceStage,
+                    state.inferenceCurrent,
+                    state.inferenceTotal,
+                    state.inferenceRate,
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else if (state.downloadProgress == null) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         else LinearProgressIndicator(progress = { state.downloadProgress.coerceIn(0f, 1f) },
             modifier = Modifier.fillMaxWidth())
     }

@@ -173,6 +173,18 @@ class MainActivity : ComponentActivity() {
                 ?: GsvRuntime.apiError?.let { getString(R.string.api_start_failed, it) }
                 ?: getString(R.string.api_stopped),
         )
+        InferenceProgressBus.listener = { progress ->
+            runOnUiThread {
+                if (ui.busy) {
+                    ui = ui.copy(
+                        inferenceStage = progress.stage,
+                        inferenceCurrent = progress.current,
+                        inferenceTotal = progress.total,
+                        inferenceRate = progress.iterationsPerSecond,
+                    )
+                }
+            }
+        }
         setContent { GsvTheme { MainScreen() } }
         DebugAcceptanceRunner.launch(this, intent)
         if (hasExternalModelAccess()) scanExternalModels(silent = true)
@@ -791,6 +803,10 @@ class MainActivity : ComponentActivity() {
         ui = ui.copy(
             busy = true,
             canPlay = false,
+            inferenceStage = "",
+            inferenceCurrent = 0,
+            inferenceTotal = 0,
+            inferenceRate = 0.0,
             status = if (state.referenceUri == null) getString(R.string.synthesizing)
             else getString(R.string.reference_decoding),
         )
@@ -821,8 +837,13 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
-            }.onSuccess { output = it; ui = ui.copy(busy = false, canPlay = true, status = getString(R.string.synthesis_complete)) }
+            }.onSuccess {
+                output = it
+                InferenceProgressBus.clear()
+                ui = ui.copy(busy = false, canPlay = true, status = getString(R.string.synthesis_complete))
+            }
                 .onFailure { error ->
+                    InferenceProgressBus.clear()
                     val message = if (error is ReferenceDurationMismatch) {
                         getString(
                             R.string.reference_exact_duration_mismatch,
@@ -1010,6 +1031,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         player?.release()
+        InferenceProgressBus.listener = null
         GsvRuntime.releaseActivity(isFinishing)
         super.onDestroy()
     }
@@ -1089,6 +1111,8 @@ internal data class UiState(
     val referenceLanguage: String = "auto", val runtimeOptions: Set<String> = emptySet(), val referenceOverrideSupported: Boolean = false,
     val referenceExactPcm16kSamples: Int? = null,
     val port: String = "9880", val serverEnabled: Boolean = false, val serverStatus: String = "",
+    val inferenceStage: String = "", val inferenceCurrent: Int = 0, val inferenceTotal: Int = 0,
+    val inferenceRate: Double = 0.0,
     val appLanguage: AppLanguage = AppLanguage.ENGLISH,
     val updateChecking: Boolean = false, val releaseCheck: ReleaseCheckResult? = null,
     val updateStatus: String = "", val showUpdatePrompt: Boolean = false,
