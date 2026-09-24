@@ -23,6 +23,12 @@ device acceptance and is not a supported v3 feature.
 This project is an independent Android deployment implementation. It is not an official
 GPT-SoVITS application and is not affiliated with the upstream maintainers.
 
+### Real-device screenshots
+
+These screenshots were captured from a running ASUS AI2501C, not an emulator:
+
+![GSV Mobile real-device screenshots](docs/gsv-mobile-screenshots.png)
+
 ## Features
 
 - GPT-SoVITS V2 Pro Plus and V4 model conversion

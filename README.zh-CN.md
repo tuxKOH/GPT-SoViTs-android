@@ -19,6 +19,12 @@ GSV Mobile 可在 Android 本地转换并运行 [GPT-SoVITS](https://github.com/
 
 本项目是独立的 Android 部署实现，并非 GPT-SoVITS 官方应用，也不隶属于上游维护者。
 
+### 真机截图
+
+以下截图直接拍摄于正在运行 GSV Mobile 的 ASUS AI2501C，并非模拟器：
+
+![GSV Mobile 真机截图](docs/gsv-mobile-screenshots.png)
+
 ## 功能
 
 - 支持 GPT-SoVITS V2 Pro Plus 和 V4 模型转换
