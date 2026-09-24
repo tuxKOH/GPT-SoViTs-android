@@ -17,6 +17,7 @@ p.add_argument('--pipeline-output',type=Path,help='Standalone pipeline package o
 p.add_argument('--model-output',type=Path,help='Standalone model package output')
 p.add_argument('--name',required=True)
 p.add_argument('--version',required=True,choices=sorted(PROFILES))
+p.add_argument('--product-version',default='v3.2.0+0',help='User-visible product/conversion version')
 p.add_argument('--frontend',type=Path,help='Converted frontend bundle; required for deployable=true')
 p.add_argument('--pipeline',default='pipeline.pt',help='Pipeline filename inside --artifacts')
 p.add_argument('--bert-stage',help='Optional staged FP32 BERT filename inside --artifacts')
@@ -116,7 +117,7 @@ def option_manifest(manifest: dict) -> None:
 
 def write_package(output: Path, artifact_role: str|None, package_files: list[dict]) -> None:
     backend_artifact = 'torchscript-cpu-staged' if staged else 'torchscript-cpu-single'
-    manifest={'format':'gsvm-deploy','format_version':1,'name':a.name,'model_version':profile.id,'sample_rate':profile.sample_rate,
+    manifest={'format':'gsvm-deploy','format_version':1,'name':a.name,'model_version':profile.id,'product_version':a.product_version,'sample_rate':profile.sample_rate,
       'executor':'torchscript-cpu-staged' if staged else 'torchscript-cpu-single','entrypoint':'synthesize_utf8_to_pcm16','api_version':1,
       'deployable':a.upstream_equivalent,'frontend_profile':a.frontend_profile,'upstream_equivalent':a.upstream_equivalent,
       'minimum_ram_mb':a.minimum_ram_mb,

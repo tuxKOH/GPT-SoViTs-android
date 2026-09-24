@@ -1,4 +1,17 @@
-# GSV Mobile
+# GSV Mobile v3.2.0
+
+<p align="center">
+  <img src="docs/gsv-mobile-icon.svg" alt="GSV Mobile icon" width="132" />
+</p>
+
+<p align="center"><strong>The best-optimized mobile version of GPT-SoVITS.</strong><br/>
+GPT-SoVITS V2 Pro Plus and V4, converted once and synthesized locally on Android.</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#android-usage">Quick start</a> ·
+  <a href="#v100-reference-speed">Benchmarks</a>
+</p>
 
 [中文文档](README.zh-CN.md)
 
@@ -142,6 +155,9 @@ Downloaded pipelines are retained in app-private persistent storage. Model list 
 persistable document URIs rather than copying every source package. Missing or moved model files are
 removed from the list when loading fails.
 
+CPU timing and the emulator thread sweep are documented in [CPU performance](docs/CPU_PERFORMANCE.md).
+The Snapdragon 8 Elite QNN trace and repeated short-phrase PCM cache are documented in [NPU performance](docs/NPU_PERFORMANCE.md). Settings can check GitHub Releases for updates; startup checks in the background and falls back to a mirror when GitHub is unreachable.
+
 ## Local OpenAI API
 
 Enable the local API from the Android **Settings** tab. It listens on device loopback port `9880` by
@@ -194,6 +210,31 @@ compatible artifacts.
 
 Packages produced by the current converter declare `reference_input_version=1`. Older packages
 still use their preset reference but are rejected explicitly when a temporary override is supplied.
+Newly converted packages carry `product_version=v3.2.0+0`; increment only the `+N` revision when
+conversion output or conversion logic changes.
+
+### V100 reference speed
+
+On a Tesla V100-SXM2 16 GB, the upstream V2 Pro Plus Firefly checkpoint (CUDA FP16, seed 1234,
+text `你好今天我们一起测试语音合成。`, 32 kHz output) took **4.84 s** for synthesis after
+**4.66 s** model load and produced 105,600 samples. This is a desktop-GPU reference, not an
+Android performance promise; the run used `ex146.wav` and omitted prompt text to use the audio preset.
+
+### Same-text device comparison
+
+All rows use the exact text `你好今天我们一起测试语音合成。` and seed 1234. Android timings are
+from the ASUS AI2501C (Snapdragon 8 Elite / SM8750) acceptance run, with the app otherwise idle.
+“First request” includes module/session work that was still lazy at that time; QNN neural CPU
+fallback was disabled.
+
+| Backend | Device | Model/session load | Synthesis / first request | Output |
+| --- | --- | ---: | ---: | ---: |
+| CUDA FP16 | Tesla V100-SXM2 16 GB | 4.66 s | 4.84 s after load | 105,600 samples |
+| CPU FP32 staged | ASUS SM8750 | BERT 4.66 s + acoustic 5.41 s (inside first request) | 26.98 s first request | 163,840 samples |
+| QNN HTP FP16 | ASUS SM8750 / V79 | common graphs warmed during load; reference graphs lazy | 21.34 s first request | 193,280 samples |
+
+The QNN row is an engineering measurement, not a release compatibility claim. Its preset path
+passed with `cpu_fallback=disabled`; temporary-reference coverage remains a separate acceptance gate.
 
 ## Qualcomm QNN / HTP (Engineering Preview)
 

@@ -52,7 +52,25 @@ def main() -> None:
     # Keep the upstream tree read-only: its web UI exporter writes a transient weight.json
     # relative to the working directory.  Execute from the writable intermediate directory
     # while exposing the upstream checkout on PYTHONPATH for imports.
-    env['PYTHONPATH']=str(upstream)+os.pathsep+env.get('PYTHONPATH','')
+    # Other upstream modules open pretrained assets relative to cwd at import time.
+    # Resolve those paths through a link in the intermediate directory, without
+    # copying gigabytes of assets or overwriting the checkout's weight.json.
+    assets_link=output/'GPT_SoVITS'
+    assets_target=upstream/'GPT_SoVITS'
+    if assets_link.is_symlink():
+        if assets_link.resolve() != assets_target.resolve():
+            raise SystemExit(f'wrong upstream asset link: {assets_link}')
+    elif assets_link.exists():
+        raise SystemExit(f'output asset path already exists: {assets_link}')
+    else:
+        assets_link.symlink_to(assets_target, target_is_directory=True)
+    # The upstream SV module imports ERes2NetV2 as a top-level module, although it
+    # lives in GPT_SoVITS/eres2net. Include that directory for exports launched
+    # outside the upstream checkout without modifying any upstream files.
+    env['PYTHONPATH']=os.pathsep.join(filter(None, (
+        str(upstream), str(upstream/'GPT_SoVITS'),
+        str(upstream/'GPT_SoVITS/eres2net'), env.get('PYTHONPATH', ''),
+    )))
     env['GSV_EXPORT_CWD']=str(output)
     run(command,output,env)
     print(f"Exported {profile.id}; lora={lora}; intermediate={output}")

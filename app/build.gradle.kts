@@ -15,14 +15,17 @@ android {
         applicationId = "ai.gsv.mobile"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "3.1.0"
+        versionCode = 8
+        versionName = "3.2.0"
         if (acceptanceAbi != null) {
             ndk { abiFilters += acceptanceAbi }
         }
     }
 
     buildFeatures { compose = true; buildConfig = true }
+    externalNativeBuild {
+        cmake { path = file("src/main/cpp/CMakeLists.txt") }
+    }
     bundle { language { enableSplit = false } }
     packaging {
         jniLibs {

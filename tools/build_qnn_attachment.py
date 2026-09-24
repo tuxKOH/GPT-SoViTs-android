@@ -118,6 +118,7 @@ def build_attachment(
     executor_descriptor: Path | None,
     base_model: Path | None,
     deployable: bool,
+    product_version: str = "v3.2.0+0",
 ) -> dict:
     output = output.resolve()
     if not output.name.endswith(QNN_SUFFIX):
@@ -208,6 +209,7 @@ def build_attachment(
         "format_version": 1,
         "name": name,
         "model_version": profile.id,
+        "product_version": product_version,
         "sample_rate": profile.sample_rate,
         "executor": "qnn-htp",
         "entrypoint": "synthesize_utf8_to_pcm16",
@@ -287,6 +289,7 @@ def main() -> None:
     parser.add_argument("--role", required=True, choices=("pipeline", "model"))
     parser.add_argument("--name", required=True)
     parser.add_argument("--version", required=True, choices=sorted(PROFILES))
+    parser.add_argument("--product-version", default="v3.2.0+0")
     parser.add_argument("--frontend-profile", default="portable-char-v1")
     parser.add_argument("--target-soc", required=True, choices=sorted(TARGETS))
     parser.add_argument("--component", action="append", default=[], metavar="NAME=DIR")
@@ -314,6 +317,7 @@ def main() -> None:
         executor_descriptor=args.executor_descriptor,
         base_model=args.base_model,
         deployable=args.deployable,
+        product_version=args.product_version,
     )
     print(
         f"Created {args.output.resolve()} role={manifest['artifact_role']} "

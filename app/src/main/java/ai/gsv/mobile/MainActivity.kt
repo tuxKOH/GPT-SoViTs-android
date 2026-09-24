@@ -5,6 +5,7 @@ import android.media.MediaPlayer
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -37,12 +38,14 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.lifecycleScope
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -133,6 +136,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applySystemBars()
         GsvRuntime.retainActivity()
         val prefs = getSharedPreferences("components", MODE_PRIVATE)
         ModelPackage.restorePipelineArchives(this)
@@ -154,8 +158,9 @@ class MainActivity : ComponentActivity() {
             port = intent.getIntExtra("api_port", 9880).toString(),
             models = readModelRecords(),
             appLanguage = AppLocale.selected(this),
-            modelInfo = loaded?.let { "${it.name} / ${it.version} / ${it.sampleRate} Hz" }
+            modelInfo = loaded?.let { "${it.name} / ${it.productVersion.ifBlank { it.version }} / ${it.sampleRate} Hz" }
                 ?: getString(R.string.model_not_loaded),
+            modelLoaded = loaded != null,
             backend = loaded?.let { engine.backendName } ?: getString(R.string.backend_not_loaded),
             runtimeOptions = loaded?.runtimeOptions ?: emptySet(),
             referenceOverrideSupported = loaded?.referenceInputVersion?.let { it >= 1 } ?: false,
@@ -172,6 +177,22 @@ class MainActivity : ComponentActivity() {
         DebugAcceptanceRunner.launch(this, intent)
         if (hasExternalModelAccess()) scanExternalModels(silent = true)
         if (intent.getBooleanExtra("start_api", false)) startApiServer()
+        if (!intent.hasExtra("qnn_product_model") && !intent.hasExtra("cpu_product_model")) {
+            checkForUpdates(automatic = true)
+        }
+    }
+
+    private fun applySystemBars() {
+        val dark = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
+            Configuration.UI_MODE_NIGHT_YES
+        window.statusBarColor = if (dark) android.graphics.Color.rgb(16, 25, 22)
+            else android.graphics.Color.rgb(245, 248, 244)
+        window.navigationBarColor = if (dark) android.graphics.Color.rgb(16, 25, 22)
+            else android.graphics.Color.rgb(245, 248, 244)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = !dark
+            isAppearanceLightNavigationBars = !dark
+        }
     }
 
     private fun requestExternalModelScan() {
@@ -249,6 +270,7 @@ class MainActivity : ComponentActivity() {
             name = manifest.getString("name"),
             version = manifest.getString("model_version"),
             split = role == "model",
+            productVersion = manifest.optString("product_version", ""),
         )
     }.getOrNull()
 
@@ -446,7 +468,8 @@ class MainActivity : ComponentActivity() {
                     installedVersions = installed,
                     qnnPipelines = installedQnnPipelines(),
                     selectedPipelineVersion = ComponentVersion.V2PP.manifestId,
-                    modelInfo = "${paired.name} / ${paired.version} / ${paired.sampleRate} Hz",
+                    modelInfo = "${paired.name} / ${paired.productVersion.ifBlank { paired.version }} / ${paired.sampleRate} Hz",
+                    modelLoaded = true,
                     backend = engine.backendName,
                     runtimeOptions = engine.loadedPackage?.runtimeOptions ?: emptySet(),
                     referenceOverrideSupported = engine.loadedPackage?.referenceInputVersion?.let { it >= 1 } ?: false,
@@ -669,6 +692,7 @@ class MainActivity : ComponentActivity() {
                         it.optBoolean("split", true),
                         it.optString("qnn_uri").takeIf(String::isNotBlank),
                         it.optString("base_model_sha256").takeIf(String::isNotBlank),
+                        it.optString("product_version").takeIf(String::isNotBlank).orEmpty(),
                     )
                 }
             }
@@ -685,7 +709,8 @@ class MainActivity : ComponentActivity() {
                     .put("version", record.version)
                     .put("split", record.split)
                     .put("qnn_uri", record.qnnUri ?: "")
-                    .put("base_model_sha256", record.baseModelSha256 ?: ""),
+                    .put("base_model_sha256", record.baseModelSha256 ?: "")
+                    .put("product_version", record.productVersion),
             )
         }
         getSharedPreferences("models", MODE_PRIVATE).edit().putString("records", array.toString()).apply()
@@ -717,7 +742,8 @@ class MainActivity : ComponentActivity() {
                 loaded(it)
                 ui = ui.copy(
                     busy = false,
-                    modelInfo = "${it.name} / ${it.version} / ${it.sampleRate} Hz",
+                    modelInfo = "${it.name} / ${it.productVersion.ifBlank { it.version }} / ${it.sampleRate} Hz",
+                    modelLoaded = true,
                     backend = engine.backendName,
                     runtimeOptions = it.runtimeOptions,
                     referenceOverrideSupported = it.referenceInputVersion >= 1,
@@ -758,7 +784,16 @@ class MainActivity : ComponentActivity() {
             ui = ui.copy(status = getString(R.string.reference_not_supported))
             return
         }
-        setBusy(if (state.referenceUri == null) getString(R.string.synthesizing) else getString(R.string.reference_decoding))
+        // A new request invalidates the previous playable result immediately.  This prevents
+        // a failed/in-flight synthesis from accidentally playing an older WAV.
+        File(cacheDir, "tts.wav").delete()
+        output = null
+        ui = ui.copy(
+            busy = true,
+            canPlay = false,
+            status = if (state.referenceUri == null) getString(R.string.synthesizing)
+            else getString(R.string.reference_decoding),
+        )
         lifecycleScope.launch {
             runCatching {
                 val options = SynthesisOptions(state.temperature.toFloat(), state.topP.toFloat(), state.topK.toInt(), state.penalty.toFloat(), state.speed.toFloat(), state.steps.toInt())
@@ -873,6 +908,43 @@ class MainActivity : ComponentActivity() {
     private fun setBusy(status: String) { ui = ui.copy(busy = true, status = status) }
     private fun openWebsite(url: String) = startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
 
+    private fun checkForUpdates(automatic: Boolean) {
+        if (ui.updateChecking) return
+        ui = ui.copy(updateChecking = true, updateStatus = if (automatic) "" else getString(R.string.update_checking))
+        lifecycleScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ReleaseUpdateChecker.check(BuildConfig.VERSION_NAME)
+                }
+            }.onSuccess { release ->
+                val dismissed = getSharedPreferences("updates", MODE_PRIVATE)
+                    .getString("dismissed_tag", null)
+                ui = ui.copy(
+                    updateChecking = false,
+                    releaseCheck = release,
+                    updateStatus = getString(
+                        if (release.isNewer) R.string.update_available_version else R.string.update_up_to_date,
+                        release.latestTag,
+                    ),
+                    showUpdatePrompt = release.isNewer && (!automatic || dismissed != release.latestTag),
+                )
+            }.onFailure { error ->
+                ui = ui.copy(
+                    updateChecking = false,
+                    updateStatus = getString(R.string.update_check_failed, error.message.orEmpty()),
+                )
+            }
+        }
+    }
+
+    private fun dismissUpdatePrompt() {
+        ui.releaseCheck?.takeIf { it.isNewer }?.let { release ->
+            getSharedPreferences("updates", MODE_PRIVATE).edit()
+                .putString("dismissed_tag", release.latestTag).apply()
+        }
+        ui = ui.copy(showUpdatePrompt = false)
+    }
+
     private fun displayName(uri: Uri): String {
         val value = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) cursor.getString(0) else null
@@ -927,6 +999,9 @@ class MainActivity : ComponentActivity() {
             onOpenProject = { openWebsite(PROJECT_URL) },
             onOpenUpstream = { openWebsite(UPSTREAM_URL) },
             onSelectLanguage = ::selectAppLanguage,
+            onCheckUpdate = { checkForUpdates(automatic = false) },
+            onOpenRelease = { ui.releaseCheck?.let { openWebsite(it.openUrl) } },
+            onDismissUpdate = ::dismissUpdatePrompt,
             onStartApi = ::startApiServer,
             onStopApi = ::stopApiServer,
             onDownloadPipelines = ::downloadPipelines,
@@ -1007,7 +1082,7 @@ internal data class UiState(
     val installedVersions: Set<String> = emptySet(), val qnnPipelines: Set<String> = emptySet(), val selectedPipelineVersion: String? = null, val downloadProgress: Float? = null,
     val models: List<ModelRecord> = emptyList(),
     val expandedModelUri: String? = null,
-    val modelInfo: String = "", val backend: String = "", val status: String = "",
+    val modelInfo: String = "", val modelLoaded: Boolean = false, val backend: String = "", val status: String = "",
     val text: String = "", val textLanguage: String = "auto", val temperature: String = "1.0", val topP: String = "1.0", val topK: String = "10",
     val penalty: String = "1.35", val speed: String = "1.0", val steps: String = "32", val busy: Boolean = false, val canPlay: Boolean = false,
     val referenceUri: Uri? = null, val referenceName: String = "", val referencePrompt: String = "",
@@ -1015,6 +1090,8 @@ internal data class UiState(
     val referenceExactPcm16kSamples: Int? = null,
     val port: String = "9880", val serverEnabled: Boolean = false, val serverStatus: String = "",
     val appLanguage: AppLanguage = AppLanguage.ENGLISH,
+    val updateChecking: Boolean = false, val releaseCheck: ReleaseCheckResult? = null,
+    val updateStatus: String = "", val showUpdatePrompt: Boolean = false,
 )
 
 internal data class ModelRecord(
@@ -1024,6 +1101,7 @@ internal data class ModelRecord(
     val split: Boolean,
     val qnnUri: String? = null,
     val baseModelSha256: String? = null,
+    val productVersion: String = "",
 )
 
 internal enum class ComponentVersion(
@@ -1042,6 +1120,30 @@ internal enum class ComponentVersion(
 }
 
 @Composable private fun GsvTheme(content: @Composable () -> Unit) {
-    val colors = if (androidx.compose.foundation.isSystemInDarkTheme()) darkColorScheme(primary = androidx.compose.ui.graphics.Color(0xFF8FD5B0)) else lightColorScheme(primary = androidx.compose.ui.graphics.Color(0xFF246B4B), secondary = androidx.compose.ui.graphics.Color(0xFF5B635D))
+    val colors = if (androidx.compose.foundation.isSystemInDarkTheme()) {
+        darkColorScheme(
+            primary = Color(0xFF94DFC0), onPrimary = Color(0xFF063C2B),
+            primaryContainer = Color(0xFF174D39), onPrimaryContainer = Color(0xFFD7F5E5),
+            secondary = Color(0xFFB6D8CB), secondaryContainer = Color(0xFF293D37),
+            onSecondaryContainer = Color(0xFFE2F3EA),
+            tertiaryContainer = Color(0xFF33443C), onTertiaryContainer = Color(0xFFDCF3E6),
+            background = Color(0xFF101916), onBackground = Color(0xFFE7F0EA),
+            surface = Color(0xFF18221E), onSurface = Color(0xFFE7F0EA),
+            surfaceVariant = Color(0xFF26352E), onSurfaceVariant = Color(0xFFB9CBC0),
+            outline = Color(0xFF73897D),
+        )
+    } else {
+        lightColorScheme(
+            primary = Color(0xFF176B50), onPrimary = Color.White,
+            primaryContainer = Color(0xFFD9F3E5), onPrimaryContainer = Color(0xFF154634),
+            secondary = Color(0xFF426E60), secondaryContainer = Color(0xFFE4F1E9),
+            onSecondaryContainer = Color(0xFF234B3C),
+            tertiaryContainer = Color(0xFFEAF1EA), onTertiaryContainer = Color(0xFF284A39),
+            background = Color(0xFFF5F8F4), onBackground = Color(0xFF17231B),
+            surface = Color.White, onSurface = Color(0xFF17231B),
+            surfaceVariant = Color(0xFFEAF0EA), onSurfaceVariant = Color(0xFF526459),
+            outline = Color(0xFF84988A),
+        )
+    }
     MaterialTheme(colorScheme = colors, typography = Typography(), content = content)
 }

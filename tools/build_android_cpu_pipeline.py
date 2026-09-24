@@ -23,6 +23,7 @@ def main() -> None:
     p.add_argument('--pipeline-output',type=Path); p.add_argument('--model-output',type=Path)
     p.add_argument('--work',required=True,type=Path); p.add_argument('--upstream',type=Path,default=Path('..'))
     p.add_argument('--language',default='all_zh'); p.add_argument('--minimum-ram-mb',type=int,default=6144)
+    p.add_argument('--product-version', default='v3.2.0+0', help='User-visible product/conversion version')
     p.add_argument('--runtime-options',action='store_true',help='Mark option-aware graph ABI v1')
     p.add_argument('--reuse-export',action='store_true',help='Reuse t2s.pt/vits.pt/conditioning.safetensors in --work')
     p.add_argument('--validation-report',type=Path,help='Passed hash-bound report from validate_v2pp_cpu_artifacts.py')
@@ -65,7 +66,8 @@ def main() -> None:
     if any(not (frontend/name).is_file() for name in frontend_files):
         run(sys.executable,here/'export_g2pw_mobile.py','--upstream',upstream,'--output',frontend)
     package=[sys.executable,here/'build_cpu_package.py','--artifacts',work,
-        '--frontend',frontend,'--name',a.name,'--version',profile.id,'--frontend-profile','full-zh-en-g2pw-v3','--minimum-ram-mb',a.minimum_ram_mb]
+        '--frontend',frontend,'--name',a.name,'--version',profile.id,'--product-version',a.product_version,
+        '--frontend-profile','full-zh-en-g2pw-v3','--minimum-ram-mb',a.minimum_ram_mb]
     if a.output is not None: package.extend(['--output',a.output.resolve()])
     if a.model_output is not None: package.extend(['--model-output',a.model_output.resolve()])
     if a.pipeline_output is not None: package.extend(['--pipeline-output',a.pipeline_output.resolve()])

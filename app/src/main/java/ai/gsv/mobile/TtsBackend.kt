@@ -118,12 +118,15 @@ class CpuBackend : ExecutionBackend {
     override fun open(model: ModelPackage): ExecutionSession {
         require(model.entrypoint == "synthesize_utf8_to_pcm16") { "unknown entrypoint ${model.entrypoint}" }
         require(model.deployable) { "CPU graphs exist, but the text frontend is not fused and the package is not deployable" }
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+        runCatching {
+            if (TorchCpuThreads.current() != threads) TorchCpuThreads.set(threads)
+        }.onFailure { Log.w("GSV_CPU_THREADS", "thread configuration unavailable", it) }
         return if(model.executor=="torchscript-cpu-staged") StagedCpuSession(model) else NativeCpuSession(model)
     }
 }
 
-/** Keeps only one large FP32 stage resident at a time. This is numerically identical to the fused
- * graph and is required for quality-first V4 on an 8 GB device. */
+/** Keeps only one large FP32 neural stage resident at a time. */
 private class StagedCpuSession(private val model: ModelPackage) : ExecutionSession {
     override val displayName = "Android CPU + G2PW (FP32 staged)"
     override fun synthesize(request: SynthesisRequest, output: File): File {
@@ -164,6 +167,11 @@ private class StagedCpuSession(private val model: ModelPackage) : ExecutionSessi
                     }
                     TimingContext.measure("bert.inference") { infer(prepared.first) to prepared.second?.let(::infer) }
                 }
+                if (BuildConfig.DEBUG) TimingContext.mark(
+                    "cpu.input_fingerprint",
+                    "phones=${prepared.first.phoneIds.contentHashCode()} " +
+                        "bert=${features.first.dataAsFloatArray.contentHashCode()} seed=${request.seed}",
+                )
                 val acoustic = TimingContext.measure("acoustic.module_load") {
                     Module.load(model.runtimeFile("runtime/acoustic.pt").path)
                 }
@@ -396,7 +404,18 @@ private object WavWriter {
             out.writeBytes("fmt "); writeIntLE(out, 16); writeShortLE(out, 1); writeShortLE(out, 1)
             writeIntLE(out, sampleRate); writeIntLE(out, sampleRate * 2)
             writeShortLE(out, 2); writeShortLE(out, 16); out.writeBytes("data"); writeIntLE(out, dataSize)
-            pcm.forEach { writeShortLE(out, it.toInt()) }
+            val buffer = ByteArray(64 * 1024)
+            var position = 0
+            for (sample in pcm) {
+                val value = sample.toInt()
+                buffer[position++] = value.toByte()
+                buffer[position++] = (value ushr 8).toByte()
+                if (position == buffer.size) {
+                    out.write(buffer)
+                    position = 0
+                }
+            }
+            if (position > 0) out.write(buffer, 0, position)
         }
     }
     private fun writeIntLE(out: RandomAccessFile, value: Int) {

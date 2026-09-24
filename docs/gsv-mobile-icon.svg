@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">GSV Mobile</title>
+  <desc id="desc">A five-bar voice waveform on a deep green square.</desc>
+  <rect width="256" height="256" rx="48" fill="#163c31"/>
+  <g fill="#fff">
+    <rect x="55" y="116" width="20" height="42" rx="4"/>
+    <rect x="87" y="84" width="20" height="106" rx="4"/>
+    <rect x="119" y="48" width="20" height="178" rx="4"/>
+    <rect x="151" y="84" width="20" height="106" rx="4"/>
+    <rect x="183" y="116" width="20" height="42" rx="4"/>
+  </g>
+  <rect x="44" y="218" width="168" height="8" rx="4" fill="#8fc2b0" opacity=".7"/>
+</svg>

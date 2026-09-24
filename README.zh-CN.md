@@ -1,4 +1,17 @@
-# GSV Mobile
+# GSV Mobile v3.2.0
+
+<p align="center">
+  <img src="docs/gsv-mobile-icon.svg" alt="GSV Mobile 图标" width="132" />
+</p>
+
+<p align="center"><strong>GPT-SoVITS 最好的手机优化版本。</strong><br/>
+GPT-SoVITS V2 Pro Plus 与 V4，一次转换，Android 本地合成。</p>
+
+<p align="center">
+  <a href="#功能">功能</a> ·
+  <a href="#android-使用">快速开始</a> ·
+  <a href="#同句性能对比">性能对比</a>
+</p>
 
 [English README](README.md)
 
@@ -104,6 +117,9 @@ adb push converted_models/voice-model.gsvm /sdcard/models/gs/
 
 然后打开“模型”并选择“扫描文件夹”。添加音色模型仍使用 Storage Access Framework，不需要授予广泛存储权限。
 
+CPU 分段耗时和模拟器线程测试记录见 [CPU 性能基线](docs/CPU_PERFORMANCE.md)。
+Snapdragon 8 Elite 的 QNN 实机执行核对、短句复用缓存与性能数据见 [NPU 性能记录](docs/NPU_PERFORMANCE.md)。设置页可手动检查 GitHub Release 更新；启动时也会后台检查新版本，原站不可达则尝试镜像。
+
 ## 本地 OpenAI API
 
 在 Android“设置”中启用本地 API，默认监听设备回环地址的 `9880` 端口：
@@ -127,6 +143,25 @@ UTF-8 文本 + 合成选项 -> 单声道 PCM16 音频
 ```
 
 仅模型包声明 `artifact_role=model`，共享流水线声明 `artifact_role=pipeline`。应用在组合前校验清单和 SHA-256；当前转换器生成的包使用 `reference_input_version=1`。
+新转换的模型会在清单中显示 `product_version=v3.2.0+0`；只有转换产物或转换逻辑变化时才递增 `+N`。
+
+### V100 速度参考
+
+Tesla V100-SXM2 16 GB 上使用上游 V2 Pro Plus Firefly 模型（CUDA FP16、seed 1234、文本“你好今天我们一起测试语音合成。”、32 kHz）实测：模型加载 **4.66 秒**，合成 **4.84 秒**，输出 105,600 采样点。该数值只是桌面 GPU 参考，不代表 Android 性能；测试使用 `ex146.wav`，省略参考文本以使用音频预设。
+
+### 同句性能对比
+
+三行使用同一句 `你好今天我们一起测试语音合成。` 和 seed 1234。Android 数据来自 ASUS
+AI2501C（Snapdragon 8 Elite / SM8750），测试时应用处于空闲状态。
+
+| 后端 | 设备 | 模型/会话加载 | 合成或首次请求 | 输出 |
+| --- | --- | ---: | ---: | ---: |
+| CUDA FP16 | Tesla V100-SXM2 16 GB | 4.66 秒 | 加载后 4.84 秒 | 105,600 samples |
+| CPU FP32 staged | ASUS SM8750 | BERT 4.66 秒 + 声学模块 5.41 秒（首次请求内） | 首次请求 26.98 秒 | 163,840 samples |
+| QNN HTP FP16 | ASUS SM8750 / V79 | 常用图在加载时预热；参考图按需加载 | 首次请求 21.34 秒 | 193,280 samples |
+
+QNN 行是工程测试数据，不代表已发布的兼容性承诺；本次预设路径已确认关闭 CPU
+fallback，临时参考音频仍需单独完成验收。
 
 ## Qualcomm QNN / HTP（工程预览）
 

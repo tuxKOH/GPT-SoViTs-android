@@ -1,5 +1,6 @@
 package ai.gsv.mobile
 
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import org.json.JSONArray
@@ -19,6 +20,7 @@ class TimingTrace(
     output: File? = null,
 ) {
     private val startNs = SystemClock.elapsedRealtimeNanos()
+    private val startProcessCpuMs = Process.getElapsedCpuTime()
     private val wallStartMs = System.currentTimeMillis()
     private val id = "${name}-${TRACE_IDS.incrementAndGet()}"
     private val outputSidecar = output?.let { File("${it.path}.timing.json") }
@@ -29,6 +31,7 @@ class TimingTrace(
         val stage: String,
         val startOffsetNs: Long,
         val durationNs: Long,
+        val processCpuMs: Long,
         val ok: Boolean,
         val error: String? = null,
         val detail: String? = null,
@@ -37,6 +40,7 @@ class TimingTrace(
     /** Records one nested or top-level stage and returns the block result unchanged. */
     fun <T> measure(stage: String, block: () -> T): T {
         val eventStartNs = SystemClock.elapsedRealtimeNanos()
+        val eventStartCpuMs = Process.getElapsedCpuTime()
         Log.i(TAG, "trace=$id stage=$stage phase=begin offset_ms=${elapsedMs(eventStartNs)}")
         var ok = false
         var failure: Throwable? = null
@@ -46,7 +50,14 @@ class TimingTrace(
             failure = error
             throw error
         } finally {
-            record(stage, eventStartNs, SystemClock.elapsedRealtimeNanos(), ok, failure)
+            record(
+                stage,
+                eventStartNs,
+                SystemClock.elapsedRealtimeNanos(),
+                Process.getElapsedCpuTime() - eventStartCpuMs,
+                ok,
+                failure,
+            )
         }
     }
 
@@ -54,7 +65,7 @@ class TimingTrace(
     fun mark(stage: String, detail: String? = null) {
         val now = SystemClock.elapsedRealtimeNanos()
         synchronized(events) {
-            events += TimingEvent(stage, now - startNs, 0L, true, detail = detail)
+            events += TimingEvent(stage, now - startNs, 0L, 0L, true, detail = detail)
         }
         val suffix = detail?.let { " detail=${sanitize(it)}" } ?: ""
         Log.i(TAG, "trace=$id stage=$stage phase=mark offset_ms=${elapsedMs(now)}$suffix")
@@ -79,6 +90,7 @@ class TimingTrace(
                     .put("monotonic_start_ns", startNs)
                     .put("monotonic_end_ns", endNs)
                     .put("total_ms", totalNs / 1_000_000.0)
+                    .put("process_cpu_ms", Process.getElapsedCpuTime() - startProcessCpuMs)
                     .put("success", success)
                 error?.let { root.put("error", it.message ?: it::class.java.simpleName) }
                 val serialized = JSONArray()
@@ -91,6 +103,7 @@ class TimingTrace(
                                 .put("duration_ns", event.durationNs)
                                 .put("offset_ms", event.startOffsetNs / 1_000_000.0)
                                 .put("duration_ms", event.durationNs / 1_000_000.0)
+                                .put("process_cpu_ms", event.processCpuMs)
                                 .put("ok", event.ok)
                                 .apply {
                                     event.error?.let { put("error", it) }
@@ -117,12 +130,20 @@ class TimingTrace(
 
     fun sidecarFile(): File? = outputSidecar
 
-    private fun record(stage: String, eventStartNs: Long, eventEndNs: Long, ok: Boolean, error: Throwable?) {
+    private fun record(
+        stage: String,
+        eventStartNs: Long,
+        eventEndNs: Long,
+        processCpuMs: Long,
+        ok: Boolean,
+        error: Throwable?,
+    ) {
         val durationNs = eventEndNs - eventStartNs
         val event = TimingEvent(
             stage = stage,
             startOffsetNs = eventStartNs - startNs,
             durationNs = durationNs,
+            processCpuMs = processCpuMs,
             ok = ok,
             error = error?.message ?: error?.let { it::class.java.simpleName },
         )
@@ -131,7 +152,7 @@ class TimingTrace(
         Log.i(
             TAG,
             "trace=$id stage=$stage phase=end offset_ms=${elapsedMs(eventStartNs)} " +
-                "duration_ms=${durationNs / 1_000_000.0} ok=$ok$suffix",
+                "duration_ms=${durationNs / 1_000_000.0} process_cpu_ms=$processCpuMs ok=$ok$suffix",
         )
     }
 

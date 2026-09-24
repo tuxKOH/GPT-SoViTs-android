@@ -11,6 +11,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.DoubleBuffer
 import java.nio.FloatBuffer
 import java.nio.IntBuffer
@@ -69,6 +70,13 @@ object QnnV2ppRuntime {
         } else {
             emptyList()
         }
+        private val shortCapacity = descriptor.getJSONObject("shapes").optInt("short_semantic_capacity", 0)
+        private val shortVitsStages = graphs.optJSONArray("vits_short")?.let {
+            graphStages(it, "vits_short")
+        }
+        private val shortReferenceVitsStages = graphs.optJSONArray("vits_reference_short")?.let {
+            graphStages(it, "vits_reference_short")
+        }
         private val shapes = descriptor.getJSONObject("shapes")
         private val preset = descriptor.getJSONObject("preset")
         private val referenceConfig = descriptor.optJSONObject("reference")
@@ -96,6 +104,9 @@ object QnnV2ppRuntime {
         private val referenceInputVersion = descriptor.getInt("reference_input_version")
         private val environment = OrtEnvironment.getEnvironment()
         private val frontend: FullTextFrontend
+        // VITS contexts are expensive to open. Keep only the active preset OR reference set,
+        // scoped to this loaded artifact; switching models closes every retained context.
+        private val vitsSessions = GraphSessionCache(environment, model)
 
         private data class RuntimeReference(
             val promptPhoneIds: IntArray,
@@ -121,6 +132,9 @@ object QnnV2ppRuntime {
             require(layers > 0 && hidden > 0)
             require(tokenCapacity in 3..512)
             require(phoneCapacity > 0 && semanticCapacity > 0 && samplesPerSemantic > 0 && eosToken > 0)
+            require(shortCapacity == 0 || shortCapacity in 1 until semanticCapacity)
+            require((shortCapacity > 0) == (shortVitsStages != null))
+            require(shortReferenceVitsStages == null || shortCapacity > 0)
             require(maxTextCodePoints > 0 && interSegmentSilenceMs in 0..2000)
             require(compactLength + semanticCapacity <= cacheCapacity) {
                 "QNN T2S cache capacity is too small for the prepared semantic length"
@@ -153,7 +167,8 @@ object QnnV2ppRuntime {
             requiredGraphs.forEach { name ->
                 require(model.runtimeFile(graphs.getString(name)).isFile) { "missing QNN graph $name" }
             }
-            (vitsStages + referenceVitsStages).forEach { stage ->
+            (vitsStages + referenceVitsStages + shortVitsStages.orEmpty() +
+                shortReferenceVitsStages.orEmpty()).forEach { stage ->
                 require(model.runtimeFile(stage.path).isFile) {
                     "missing QNN graph partition ${stage.name}"
                 }
@@ -170,11 +185,32 @@ object QnnV2ppRuntime {
                 htpFp16Precision = true,
                 htpGraphOptimizationMode = "3",
             )
+            // Pay the common QNN/HTP context creation cost while the model is being loaded.
+            // Reference and short-form graphs stay lazy: opening every variant here can hold
+            // several HTP contexts at once, needlessly increasing cold-start memory and making
+            // a normal preset request look hung. GraphSessionCache still retains those graphs
+            // after their first use, so a temporary reference or short request pays the cost
+            // only once.
+            listOf("bert", "t2s_prefill", "t2s_step").forEach { name ->
+                vitsSessions.warmPath(model.runtimeFile(graphs.getString(name)), name)
+            }
+            vitsStages.forEach { vitsSessions.warm(it) }
         }
 
         override val displayName = "QNN HTP (${target.displayName})"
 
         override fun synthesize(request: SynthesisRequest, output: File): File {
+            val trace = TimingTrace("synthesis.qnn", output)
+            return try {
+                TimingContext.with(trace) { synthesizeInternal(request, output) }
+                    .also { trace.finish() }
+            } catch (error: Throwable) {
+                trace.finish(success = false, error = error)
+                throw error
+            }
+        }
+
+        private fun synthesizeInternal(request: SynthesisRequest, output: File): File {
             require(request.text.isNotBlank()) { "text must not be empty" }
             requireOptions(model, request.options, request.seed)
             requireReferenceInput(model, request.reference)
@@ -187,11 +223,15 @@ object QnnV2ppRuntime {
             val preparedSegments = TimingContext.measure("qnn.frontend.prepare") {
                 prepareSegments(request.text, request.language)
             }
-            val runtimeReference = request.reference?.let { reference ->
-                TimingContext.measure("qnn.reference.prepare") {
-                    prepareRuntimeReference(reference)
+            val runtimeReference by lazy {
+                request.reference?.let { reference ->
+                    TimingContext.measure("qnn.reference.prepare") {
+                        prepareRuntimeReference(reference)
+                    }
                 }
             }
+            // Every request is synthesized afresh.  Completed PCM must never be reused:
+            // stochastic sampling, reference changes, and user retries all need a new result.
             val pcmSegments = preparedSegments.mapIndexed { index, prepared ->
                 synthesizePrepared(prepared, request, index, runtimeReference)
             }
@@ -226,7 +266,7 @@ object QnnV2ppRuntime {
                 "text needs ${prepared.phoneIds.size} phones, QNN capacity is $phoneCapacity"
             }
             val phoneIds = IntArray(prepared.phoneIds.size) { prepared.phoneIds[it].toInt() }
-            val bert = runBertFeatures(prepared)
+            val bert = runBertFeatures(prepared, vitsSessions)
             val prefill = if (runtimeReference == null) {
                 runPrefill(
                     environment,
@@ -235,6 +275,7 @@ object QnnV2ppRuntime {
                     bert,
                     phoneCapacity,
                     paddedInputs,
+                    vitsSessions,
                 )
             } else {
                 runReferencePrefill(
@@ -246,6 +287,7 @@ object QnnV2ppRuntime {
                     runtimeReference.promptPhoneIds,
                     runtimeReference.promptBert,
                     phoneCapacity,
+                    vitsSessions,
                 )
             }
             val activePromptSemantic = runtimeReference?.promptSemantic ?: promptSemantic
@@ -273,17 +315,28 @@ object QnnV2ppRuntime {
                     hidden,
                     eosToken,
                     initialCacheValid,
+                    vitsSessions,
                 )
+                val useShort = shortCapacity > 0 && semantics.validLength <= shortCapacity &&
+                    (runtimeReference == null || shortReferenceVitsStages != null)
+                val selectedCapacity = if (useShort) shortCapacity else semanticCapacity
+                val selectedSemantics = if (useShort) {
+                    semantics.copy(values = semantics.values.copyOf(shortCapacity))
+                } else semantics
+                TimingContext.mark("qnn.vits.capacity", selectedCapacity.toString())
                 val audio = if (runtimeReference == null) {
                     runVits(
-                        environment, model, vitsStages, phoneIds, semantics, attemptSeed,
-                        phoneCapacity, semanticCapacity, samplesPerSemantic, paddedInputs,
+                        environment, model, if (useShort) requireNotNull(shortVitsStages) else vitsStages,
+                        phoneIds, selectedSemantics, attemptSeed, phoneCapacity,
+                        selectedCapacity, samplesPerSemantic, paddedInputs, vitsSessions,
                     )
                 } else {
                     runReferenceVits(
-                        environment, model, referenceVitsStages, phoneIds, semantics,
+                        environment, model,
+                        if (useShort) requireNotNull(shortReferenceVitsStages) else referenceVitsStages,
+                        phoneIds, selectedSemantics,
                         runtimeReference.referenceSpectrogram, runtimeReference.speakerEmbedding,
-                        attemptSeed, phoneCapacity, semanticCapacity, samplesPerSemantic,
+                        attemptSeed, phoneCapacity, selectedCapacity, samplesPerSemantic, vitsSessions,
                     )
                 }
                 val pcm = ShortArray(audio.size) { index ->
@@ -334,11 +387,13 @@ object QnnV2ppRuntime {
                 environment,
                 model.runtimeFile(graphs.getString("reference_ssl")),
                 pcm16,
+                vitsSessions,
             )
             val runtimePromptSemantic = runPromptSemantic(
                 environment,
                 model.runtimeFile(graphs.getString("reference_prompt_semantic")),
                 ssl,
+                vitsSessions,
             )
             require(runtimePromptSemantic.size == config.getInt("prompt_semantic_length")) {
                 "QNN reference prompt semantic output has an unexpected length"
@@ -348,6 +403,7 @@ object QnnV2ppRuntime {
                 model.runtimeFile(graphs.getString("reference_conditioning")),
                 pcm16,
                 reflectPad(pcm32, config.getInt("spectrogram_reflect_pad")),
+                vitsSessions,
             )
             require(
                 conditioning.spectrogram.size ==
@@ -357,7 +413,7 @@ object QnnV2ppRuntime {
             require(conditioning.speakerEmbedding.size == config.getInt("speaker_embedding_size")) {
                 "QNN reference speaker embedding output has an unexpected shape"
             }
-            val promptBert = runBertFeatures(prompt)
+            val promptBert = runBertFeatures(prompt, vitsSessions)
             return RuntimeReference(
                 promptPhoneIds = IntArray(prompt.phoneIds.size) { prompt.phoneIds[it].toInt() },
                 promptBert = promptBert,
@@ -391,7 +447,10 @@ object QnnV2ppRuntime {
             }
         }
 
-        private fun runBertFeatures(prepared: FullTextFrontend.Prepared): ShortArray {
+        private fun runBertFeatures(
+            prepared: FullTextFrontend.Prepared,
+            sessions: GraphSessionCache? = null,
+        ): ShortArray {
             val output = ShortArray(prepared.phoneIds.size * 1024)
             prepared.bertSpans.forEach { span ->
                 val tokenIds = IntArray(span.tokenIds.size) { span.tokenIds[it].toInt() }
@@ -401,6 +460,7 @@ object QnnV2ppRuntime {
                     tokenIds,
                     span.word2ph,
                     tokenCapacity,
+                    sessions = sessions,
                 )
                 require(features.size == span.phoneCount * 1024)
                 features.copyInto(output, span.phoneOffset * 1024)
@@ -487,7 +547,10 @@ object QnnV2ppRuntime {
         private fun segmentSeed(seed: Long, segmentIndex: Int): Long =
             if (seed >= 0) seed + segmentIndex else System.nanoTime()
 
-        override fun close() = frontend.close()
+        override fun close() {
+            vitsSessions.close()
+            frontend.close()
+        }
     }
 
     fun run(root: File, output: File, resultFile: File): String {
@@ -631,7 +694,8 @@ object QnnV2ppRuntime {
         tokenIds: IntArray,
         word2ph: IntArray,
         tokenCapacity: Int = 6,
-    ): ShortArray = withSession(environment, model, "bert") { session ->
+        sessions: GraphSessionCache? = null,
+    ): ShortArray = withSession(environment, model, "bert", sessions = sessions) { session ->
         require(tokenIds.size <= tokenCapacity)
         val padded = IntArray(tokenCapacity).also { tokenIds.copyInto(it) }
         val attention = IntArray(tokenCapacity) { if (it < tokenIds.size) 1 else 0 }
@@ -676,7 +740,8 @@ object QnnV2ppRuntime {
         environment: OrtEnvironment,
         model: File,
         pcm16: FloatArray,
-    ): ShortArray = withSession(environment, model, "reference_ssl") { session ->
+        sessions: GraphSessionCache? = null,
+    ): ShortArray = withSession(environment, model, "reference_ssl", sessions = sessions) { session ->
         val values = ShortArray(pcm16.size) { floatToHalf(pcm16[it]) }
         half(environment, values, session.inputShape("reference_pcm_16k", values.size)).use { pcm ->
             session.run(mapOf("reference_pcm_16k" to pcm)).use { outputs -> outputs.half(0) }
@@ -687,7 +752,8 @@ object QnnV2ppRuntime {
         environment: OrtEnvironment,
         model: File,
         ssl: ShortArray,
-    ): IntArray = withSession(environment, model, "reference_prompt_semantic") { session ->
+        sessions: GraphSessionCache? = null,
+    ): IntArray = withSession(environment, model, "reference_prompt_semantic", sessions = sessions) { session ->
         half(environment, ssl, session.inputShape("ssl_content", ssl.size)).use { content ->
             session.run(mapOf("ssl_content" to content)).use { outputs -> outputs.ints(0) }
         }
@@ -698,7 +764,8 @@ object QnnV2ppRuntime {
         model: File,
         pcm16: FloatArray,
         reflectedPcm32: FloatArray,
-    ): ReferenceConditioning = withSession(environment, model, "reference_conditioning") { session ->
+        sessions: GraphSessionCache? = null,
+    ): ReferenceConditioning = withSession(environment, model, "reference_conditioning", sessions = sessions) { session ->
         val pcm16Half = ShortArray(pcm16.size) { floatToHalf(pcm16[it]) }
         val pcm32Half = ShortArray(reflectedPcm32.size) { floatToHalf(reflectedPcm32[it]) }
         half(
@@ -735,7 +802,8 @@ object QnnV2ppRuntime {
         bert: ShortArray,
         phoneCapacity: Int = 8,
         paddingMaskInput: Boolean = false,
-    ): Prefill = withSession(environment, model, "t2s_prefill") { session ->
+        sessions: GraphSessionCache? = null,
+    ): Prefill = withSession(environment, model, "t2s_prefill", sessions = sessions) { session ->
         require(phoneIds.isNotEmpty() && phoneIds.size <= phoneCapacity)
         require(bert.size == phoneIds.size * 1024)
         val paddedPhones = IntArray(phoneCapacity).also { phoneIds.copyInto(it) }
@@ -780,7 +848,8 @@ object QnnV2ppRuntime {
         promptPhoneIds: IntArray,
         promptBert: ShortArray,
         phoneCapacity: Int,
-    ): Prefill = withSession(environment, model, "t2s_reference_prefill") { session ->
+        sessions: GraphSessionCache? = null,
+    ): Prefill = withSession(environment, model, "t2s_reference_prefill", sessions = sessions) { session ->
         require(phoneIds.isNotEmpty() && phoneIds.size <= phoneCapacity)
         require(promptPhoneIds.isNotEmpty() && promptPhoneIds.size <= phoneCapacity)
         require(bert.size == phoneIds.size * 1024)
@@ -848,6 +917,45 @@ object QnnV2ppRuntime {
 
     private data class GeneratedSemantics(val values: IntArray, val validLength: Int)
 
+    /** Keeps the full FP16 K/V cache in direct memory so each token updates only one slot. */
+    private class DirectHalfCache(
+        environment: OrtEnvironment,
+        compact: ShortArray,
+        compactLength: Int,
+        private val cacheCapacity: Int,
+        private val layers: Int,
+        private val hidden: Int,
+        shape: LongArray,
+    ) : java.io.Closeable {
+        private val buffer: ShortBuffer
+        val tensor: OnnxTensor
+
+        init {
+            require(compact.size == layers * compactLength * hidden)
+            val elements = Math.multiplyExact(Math.multiplyExact(layers, cacheCapacity), hidden)
+            buffer = ByteBuffer.allocateDirect(Math.multiplyExact(elements, 2))
+                .order(ByteOrder.nativeOrder())
+                .asShortBuffer()
+            repeat(layers) { layer ->
+                buffer.position(layer * cacheCapacity * hidden)
+                buffer.put(compact, layer * compactLength * hidden, compactLength * hidden)
+            }
+            buffer.position(0)
+            tensor = OnnxTensor.createTensor(environment, buffer, shape, OnnxJavaType.FLOAT16)
+        }
+
+        fun writeSlot(slot: Int, update: ShortArray) {
+            require(update.size == layers * hidden)
+            repeat(layers) { layer ->
+                val destination = layer * cacheCapacity * hidden + slot * hidden
+                val source = layer * hidden
+                repeat(hidden) { index -> buffer.put(destination + index, update[source + index]) }
+            }
+        }
+
+        override fun close() = tensor.close()
+    }
+
     private fun runSteps(
         environment: OrtEnvironment,
         model: File,
@@ -863,97 +971,87 @@ object QnnV2ppRuntime {
         hidden: Int = acceptanceHidden,
         eosToken: Int = acceptanceEos,
         initialCacheValid: BooleanArray? = null,
-    ): GeneratedSemantics = withSession(environment, model, "t2s_step") { session ->
+        sessions: GraphSessionCache? = null,
+    ): GeneratedSemantics = withSession(environment, model, "t2s_step", sessions = sessions) { session ->
         require(initialCacheValid == null || initialCacheValid.size == compactLength)
-        val keys = expandCache(prefill.keys, compactLength, cacheCapacity, layers, hidden)
-        val values = expandCache(prefill.values, compactLength, cacheCapacity, layers, hidden)
-        val generated = IntArray(semanticCapacity)
-        val previous = ArrayList<Int>(promptSemantic.size + semanticCapacity).apply {
-            promptSemantic.forEach(::add)
-        }
-        val random = Random(seed.takeIf { it >= 0 } ?: System.nanoTime())
-        var logits = prefill.logits
-        var validLength = 0
-        for (iteration in 0 until semanticCapacity) {
-            // V2 Pro Plus's infer_panel_naive excludes EOS for its first 11 decoding
-            // iterations.  Without this, a valid early EOS can produce an unusably short
-            // semantic sequence and effectively silent audio.
-            val token = sampleToken(
-                logits,
-                previous,
-                random,
-                options,
-                eosToken,
-                excludeEos = iteration < minimumSemanticIterations,
-            )
-            if (token == eosToken) break
-            generated[iteration] = token
-            validLength++
-            previous.add(token)
-            if (iteration == semanticCapacity - 1) break
-            val slot = compactLength + iteration
-            val position = sinePosition(promptLength + iteration, hidden)
-            val writeMask = ShortArray(cacheCapacity).also { it[slot] = floatToHalf(1.0f) }
-            val attentionBias = ShortArray(cacheCapacity) { index ->
-                val prefillValid = index < compactLength && (initialCacheValid?.get(index) ?: true)
-                val generatedValid = index in compactLength..slot
-                floatToHalf(if (prefillValid || generatedValid) 0.0f else -10000.0f)
-            }
-            int32(
-                environment,
-                intArrayOf(token),
-                session.inputShape("last_token", 1),
-            ).use { lastToken ->
-                half(
-                    environment,
-                    position,
-                    session.inputShape("position_embedding", position.size),
-                ).use { positionTensor ->
-                    half(environment, keys, session.inputShape("k_cache", keys.size)).use { keyTensor ->
+        val cacheElements = Math.multiplyExact(Math.multiplyExact(layers, cacheCapacity), hidden)
+        DirectHalfCache(
+            environment, prefill.keys, compactLength, cacheCapacity, layers, hidden,
+            session.inputShape("k_cache", cacheElements),
+        ).use { keys ->
+            DirectHalfCache(
+                environment, prefill.values, compactLength, cacheCapacity, layers, hidden,
+                session.inputShape("v_cache", cacheElements),
+            ).use { values ->
+                val generated = IntArray(semanticCapacity)
+                val previous = ArrayList<Int>(promptSemantic.size + semanticCapacity).apply {
+                    promptSemantic.forEach(::add)
+                }
+                val random = Random(seed.takeIf { it >= 0 } ?: System.nanoTime())
+                var logits = prefill.logits
+                var validLength = 0
+                for (iteration in 0 until semanticCapacity) {
+                    // V2 Pro Plus's infer_panel_naive excludes EOS for its first 11 decoding
+                    // iterations. Without this, a valid early EOS can produce unusably short audio.
+                    val token = sampleToken(
+                        logits, previous, random, options, eosToken,
+                        excludeEos = iteration < minimumSemanticIterations,
+                    )
+                    if (token == eosToken) break
+                    generated[iteration] = token
+                    validLength++
+                    previous.add(token)
+                    if (iteration == semanticCapacity - 1) break
+                    val slot = compactLength + iteration
+                    val position = sinePosition(promptLength + iteration, hidden)
+                    val writeMask = ShortArray(cacheCapacity).also { it[slot] = floatToHalf(1.0f) }
+                    val attentionBias = ShortArray(cacheCapacity) { index ->
+                        val prefillValid = index < compactLength && (initialCacheValid?.get(index) ?: true)
+                        val generatedValid = index in compactLength..slot
+                        floatToHalf(if (prefillValid || generatedValid) 0.0f else -10000.0f)
+                    }
+                    int32(
+                        environment, intArrayOf(token), session.inputShape("last_token", 1),
+                    ).use { lastToken ->
                         half(
-                            environment,
-                            values,
-                            session.inputShape("v_cache", values.size),
-                        ).use { valueTensor ->
+                            environment, position, session.inputShape("position_embedding", position.size),
+                        ).use { positionTensor ->
                             half(
-                                environment,
-                                writeMask,
-                                session.inputShape("write_mask", writeMask.size),
+                                environment, writeMask, session.inputShape("write_mask", writeMask.size),
                             ).use { maskTensor ->
                                 half(
-                                    environment,
-                                    attentionBias,
+                                    environment, attentionBias,
                                     session.inputShape("attention_bias", attentionBias.size),
                                 ).use { biasTensor ->
                                     session.run(
                                         mapOf(
                                             "last_token" to lastToken,
                                             "position_embedding" to positionTensor,
-                                            "k_cache" to keyTensor,
-                                            "v_cache" to valueTensor,
+                                            "k_cache" to keys.tensor,
+                                            "v_cache" to values.tensor,
                                             "write_mask" to maskTensor,
                                             "attention_bias" to biasTensor,
                                         )
                                     ).use { outputs ->
                                         logits = outputs.floats(0)
                                         if (iteration == 0) Log.i(tag, "step logits ${floatStats(logits)}")
-                                        writeCacheSlot(keys, slot, outputs.half(1), cacheCapacity, layers, hidden)
-                                        writeCacheSlot(values, slot, outputs.half(2), cacheCapacity, layers, hidden)
+                                        keys.writeSlot(slot, outputs.half(1))
+                                        values.writeSlot(slot, outputs.half(2))
                                     }
                                 }
                             }
                         }
                     }
+                    Log.i(tag, "t2s token ${iteration + 1}/$semanticCapacity=$token")
                 }
+                if (validLength == 0) {
+                    generated[0] = 0
+                    validLength = 1
+                    Log.w(tag, "T2S predicted EOS before the first semantic token; using upstream-compatible zero token")
+                }
+                GeneratedSemantics(generated, validLength)
             }
-            Log.i(tag, "t2s token ${iteration + 1}/$semanticCapacity=$token")
         }
-        if (validLength == 0) {
-            generated[0] = 0
-            validLength = 1
-            Log.w(tag, "T2S predicted EOS before the first semantic token; using upstream-compatible zero token")
-        }
-        GeneratedSemantics(generated, validLength)
     }
 
     private fun runAcceptanceVits(
@@ -1001,6 +1099,7 @@ object QnnV2ppRuntime {
         semanticCapacity: Int = semantics.values.size,
         samplesPerSemantic: Int = 1280,
         paddingMaskInputs: Boolean = false,
+        sessions: GraphSessionCache? = null,
     ): FloatArray {
         require(phoneIds.isNotEmpty() && phoneIds.size <= phoneCapacity)
         require(semantics.values.size == semanticCapacity)
@@ -1024,7 +1123,7 @@ object QnnV2ppRuntime {
             inputs["semantic_valid"] = TensorPayload.half(semanticValid)
             inputs["text_valid"] = TensorPayload.half(textValid)
         }
-        val raw = runGraphStages(environment, model, stages, inputs, "audio").floats()
+        val raw = runGraphStages(environment, model, stages, inputs, "audio", sessions).floats()
         val validSamples = (semantics.validLength * samplesPerSemantic).coerceAtMost(raw.size)
         require(validSamples > 0) { "QNN VITS returned no valid PCM samples" }
         Log.i(tag, "vits partitioned output count=${raw.size} validSamples=$validSamples")
@@ -1043,6 +1142,7 @@ object QnnV2ppRuntime {
         phoneCapacity: Int,
         semanticCapacity: Int,
         samplesPerSemantic: Int,
+        sessions: GraphSessionCache,
     ): FloatArray {
         require(phoneIds.isNotEmpty() && phoneIds.size <= phoneCapacity)
         require(semantics.values.size == semanticCapacity)
@@ -1067,7 +1167,7 @@ object QnnV2ppRuntime {
             "reference_spectrogram" to TensorPayload.half(referenceSpectrogram),
             "speaker_embedding" to TensorPayload.half(speakerEmbedding),
         )
-        val raw = runGraphStages(environment, model, stages, inputs, "audio").floats()
+        val raw = runGraphStages(environment, model, stages, inputs, "audio", sessions).floats()
         val validSamples = (semantics.validLength * samplesPerSemantic).coerceAtMost(raw.size)
         require(validSamples > 0) { "QNN reference VITS returned no valid PCM samples" }
         return raw.copyOf(validSamples)
@@ -1252,6 +1352,7 @@ object QnnV2ppRuntime {
         stages: List<GraphStage>,
         initial: Map<String, TensorPayload>,
         outputName: String,
+        sessions: GraphSessionCache? = null,
     ): TensorPayload {
         val values = HashMap(initial)
         val remainingUses = HashMap<String, Int>()
@@ -1259,7 +1360,15 @@ object QnnV2ppRuntime {
             remainingUses[input.logicalName] = (remainingUses[input.logicalName] ?: 0) + 1
         }
         stages.forEach { stage ->
-            val produced = withSession(environment, model.runtimeFile(stage.path), stage.name) { session ->
+            val runStage: ((OrtSession) -> Map<String, TensorPayload>) -> Map<String, TensorPayload> =
+                { block ->
+                    if (sessions == null) {
+                        withSession(environment, model.runtimeFile(stage.path), stage.name, block = block)
+                    } else {
+                        sessions.use(stage, block)
+                    }
+                }
+            val produced = runStage { session ->
                 validateStageSession(session, stage)
                 val tensors = linkedMapOf<String, OnnxTensor>()
                 try {
@@ -1297,20 +1406,58 @@ object QnnV2ppRuntime {
         return requireNotNull(values[outputName]) { "partitioned QNN graph did not produce $outputName" }
     }
 
-    private inline fun <T> withSession(
+    /** Retains only one VITS variant per loaded artifact. Debug profiling uses one-shot sessions. */
+    private class GraphSessionCache(
+        private val environment: OrtEnvironment,
+        private val model: ModelPackage,
+    ) : AutoCloseable {
+        private val sessions = LinkedHashMap<String, OrtSession>()
+
+        /** Open a graph during model load so its HTP context is ready before the first request. */
+        fun warmPath(path: File, stage: String) {
+            sessions.getOrPut(path.canonicalPath) {
+                TimingContext.measure("qnn.$stage.session_create") {
+                    openQnnSession(environment, path, stage, null)
+                }
+            }
+        }
+
+        fun warm(stage: GraphStage) = warmPath(model.runtimeFile(stage.path), stage.name)
+
+        fun <T> usePath(path: File, stage: String, block: (OrtSession) -> T): T {
+            if (DebugQnnProfiles.directory != null) {
+                return withSession(environment, path, stage, block = block)
+            }
+            warmPath(path, stage)
+            val session = requireNotNull(sessions[path.canonicalPath])
+            return try {
+                TimingContext.measure("qnn.$stage.run") { block(session) }
+            } catch (error: Throwable) {
+                clear()
+                throw error
+            }
+        }
+
+        fun <T> use(stage: GraphStage, block: (OrtSession) -> T): T {
+            val path = model.runtimeFile(stage.path)
+            return usePath(path, stage.name, block)
+        }
+
+        private fun clear() {
+            sessions.values.forEach { runCatching { it.close() } }
+            sessions.clear()
+        }
+
+        override fun close() = clear()
+    }
+
+    private fun openQnnSession(
         environment: OrtEnvironment,
         model: File,
         stage: String,
-        block: (OrtSession) -> T,
-    ): T {
+        profilePrefix: String?,
+    ): OrtSession {
         require(model.isFile) { "missing EPContext model: $model" }
-        val profilePrefix = if (BuildConfig.DEBUG) {
-            File(model.parentFile, "profiles").also { it.mkdirs() }
-                .resolve("${stage.replace(Regex("[^A-Za-z0-9_.-]"), "_")}-${System.nanoTime()}")
-                .path
-        } else {
-            null
-        }
         val options = OrtSession.SessionOptions().apply {
             setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
             addConfigEntry("session.disable_cpu_ep_fallback", "1")
@@ -1325,57 +1472,31 @@ object QnnV2ppRuntime {
             )
         }
         return options.use { sessionOptions ->
-            environment.createSession(model.path, sessionOptions).use { session ->
+            environment.createSession(model.path, sessionOptions).also { session ->
                 Log.i(tag, "$stage session inputs=${session.inputNames} outputs=${session.outputNames}")
-                try {
-                    block(session)
-                } finally {
-                    if (profilePrefix != null) {
-                        runCatching { session.endProfiling() }
-                            .onSuccess { path -> Log.i(tag, "$stage QNN profile=$path cpuFallback=disabled") }
-                            .onFailure { error -> Log.w(tag, "$stage QNN profile close failed", error) }
-                    }
+            }
+        }
+    }
+
+    private fun <T> withSession(
+        environment: OrtEnvironment,
+        model: File,
+        stage: String,
+        sessions: GraphSessionCache? = null,
+        block: (OrtSession) -> T,
+    ): T {
+        sessions?.let { return it.usePath(model, stage, block) }
+        val profilePrefix = if (BuildConfig.DEBUG) DebugQnnProfiles.prefix(stage) else null
+        return openQnnSession(environment, model, stage, profilePrefix).use { session ->
+            try {
+                block(session)
+            } finally {
+                if (profilePrefix != null) {
+                    runCatching { session.endProfiling() }
+                        .onSuccess { path -> Log.i(tag, "$stage QNN profile=$path cpuFallback=disabled") }
+                        .onFailure { error -> Log.w(tag, "$stage QNN profile close failed", error) }
                 }
             }
-        }
-    }
-
-    private fun expandCache(
-        compact: ShortArray,
-        compactLength: Int,
-        cacheCapacity: Int,
-        layers: Int,
-        hidden: Int,
-    ): ShortArray {
-        require(compact.size == layers * compactLength * hidden)
-        return ShortArray(layers * cacheCapacity * hidden).also { expanded ->
-            repeat(layers) { layer ->
-                compact.copyInto(
-                    expanded,
-                    layer * cacheCapacity * hidden,
-                    layer * compactLength * hidden,
-                    (layer + 1) * compactLength * hidden,
-                )
-            }
-        }
-    }
-
-    private fun writeCacheSlot(
-        cache: ShortArray,
-        slot: Int,
-        update: ShortArray,
-        cacheCapacity: Int,
-        layers: Int,
-        hidden: Int,
-    ) {
-        require(update.size == layers * hidden)
-        repeat(layers) { layer ->
-            update.copyInto(
-                cache,
-                layer * cacheCapacity * hidden + slot * hidden,
-                layer * hidden,
-                (layer + 1) * hidden,
-            )
         }
     }
 

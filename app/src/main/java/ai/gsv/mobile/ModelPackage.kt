@@ -20,6 +20,8 @@ data class ModelPackage(
     val root: File,
     val name: String,
     val version: String,
+    /** Product/reconstruction version shown to users (independent of the stable model ABI id). */
+    val productVersion: String = "",
     val sampleRate: Int,
     val runtime: String,
     val formatVersion: Int,
@@ -526,6 +528,7 @@ data class ModelPackage(
                 root = root,
                 name = manifest.getString("name"),
                 version = manifest.getString("model_version"),
+                productVersion = manifest.optString("product_version", ""),
                 sampleRate = manifest.optInt("sample_rate", 32000),
                 runtime = manifest.optString("runtime", manifest.optString("executor", "unknown")),
                 formatVersion = manifest.getInt("format_version"),

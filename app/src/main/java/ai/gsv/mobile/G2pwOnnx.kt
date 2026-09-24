@@ -80,6 +80,7 @@ class G2pwOnnx(
     private val environment = OrtEnvironment.getEnvironment()
     private val qnnEnabled = qnnTarget != null
     private val profilingEnabled = qnnEnabled && BuildConfig.DEBUG
+    private val profilePrefix = if (profilingEnabled) DebugQnnProfiles.prefix("g2pw") else null
     private var profileEnded = false
     var executionStats: QnnExecutionStats? = null
         private set
@@ -90,7 +91,7 @@ class G2pwOnnx(
             if (qnnTarget != null) {
                 setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING)
                 addConfigEntry("session.disable_cpu_ep_fallback", if (strictQnn) "1" else "0")
-                if (profilingEnabled) enableProfiling(File(model.parentFile, "qnn-profile").path)
+                profilePrefix?.let { enableProfiling(it) }
                 val options = HashMap<String, String>().apply {
                     put("backend_type", "htp")
                     // Keep the quality reference explicit. Qualcomm HTP uses FP16 math for FP
