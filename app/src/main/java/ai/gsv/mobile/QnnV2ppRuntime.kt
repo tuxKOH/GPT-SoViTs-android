@@ -194,7 +194,11 @@ object QnnV2ppRuntime {
             listOf("bert", "t2s_prefill", "t2s_step").forEach { name ->
                 vitsSessions.warmPath(model.runtimeFile(graphs.getString(name)), name)
             }
-            vitsStages.forEach { vitsSessions.warm(it) }
+            // Short-bucket attachments are intended for the common short-phrase path. Warm
+            // that smaller graph set during model load so the first synthesis does not pay
+            // several seconds of HTP context creation. Long requests still open the full
+            // bucket lazily; attachments without a short bucket keep the original behavior.
+            (shortVitsStages ?: vitsStages).forEach { vitsSessions.warm(it) }
         }
 
         override val displayName = "QNN HTP (${target.displayName})"
@@ -917,43 +921,57 @@ object QnnV2ppRuntime {
 
     private data class GeneratedSemantics(val values: IntArray, val validLength: Int)
 
-    /** Keeps the full FP16 K/V cache in direct memory so each token updates only one slot. */
-    private class DirectHalfCache(
+    /**
+     * Reusable cache storage for T2S. QNN may retain the address of an input buffer after the
+     * first run, so two complete native buffers are alternated between steps. Only the new
+     * cache slot is written after each run; no full-cache heap/native copy is performed.
+     */
+    private class StepCache(
         environment: OrtEnvironment,
         compact: ShortArray,
         compactLength: Int,
         private val cacheCapacity: Int,
         private val layers: Int,
         private val hidden: Int,
-        shape: LongArray,
+        private val shape: LongArray,
     ) : java.io.Closeable {
-        private val buffer: ShortBuffer
-        val tensor: OnnxTensor
+        private val elementCount = Math.multiplyExact(Math.multiplyExact(layers, cacheCapacity), hidden)
+        private val storages = Array(2) {
+            ByteBuffer.allocateDirect(Math.multiplyExact(elementCount, 2))
+                .order(ByteOrder.nativeOrder())
+        }
+        private val shorts = storages.map { it.asShortBuffer() }
 
         init {
             require(compact.size == layers * compactLength * hidden)
-            val elements = Math.multiplyExact(Math.multiplyExact(layers, cacheCapacity), hidden)
-            buffer = ByteBuffer.allocateDirect(Math.multiplyExact(elements, 2))
-                .order(ByteOrder.nativeOrder())
-                .asShortBuffer()
-            repeat(layers) { layer ->
-                buffer.position(layer * cacheCapacity * hidden)
-                buffer.put(compact, layer * compactLength * hidden, compactLength * hidden)
+            shorts.forEach { buffer ->
+                repeat(layers) { layer ->
+                    buffer.position(layer * cacheCapacity * hidden)
+                    buffer.put(compact, layer * compactLength * hidden, compactLength * hidden)
+                }
+                buffer.position(0)
             }
-            buffer.position(0)
-            tensor = OnnxTensor.createTensor(environment, buffer, shape, OnnxJavaType.FLOAT16)
+        }
+
+        fun view(environment: OrtEnvironment, bank: Int): OnnxTensor {
+            val view = shorts[bank and 1].duplicate().also { it.position(0) }
+            return OnnxTensor.createTensor(environment, view, shape, OnnxJavaType.FLOAT16)
         }
 
         fun writeSlot(slot: Int, update: ShortArray) {
             require(update.size == layers * hidden)
-            repeat(layers) { layer ->
-                val destination = layer * cacheCapacity * hidden + slot * hidden
-                val source = layer * hidden
-                repeat(hidden) { index -> buffer.put(destination + index, update[source + index]) }
+            shorts.forEach { buffer ->
+                repeat(layers) { layer ->
+                    buffer.position(layer * cacheCapacity * hidden + slot * hidden)
+                    buffer.put(update, layer * hidden, hidden)
+                }
+                buffer.position(0)
             }
         }
 
-        override fun close() = tensor.close()
+        override fun close() {
+            // The direct buffer is reclaimed by the JVM. No tensor is retained between steps.
+        }
     }
 
     private fun runSteps(
@@ -974,14 +992,13 @@ object QnnV2ppRuntime {
         sessions: GraphSessionCache? = null,
     ): GeneratedSemantics = withSession(environment, model, "t2s_step", sessions = sessions) { session ->
         require(initialCacheValid == null || initialCacheValid.size == compactLength)
-        val cacheElements = Math.multiplyExact(Math.multiplyExact(layers, cacheCapacity), hidden)
-        DirectHalfCache(
+        StepCache(
             environment, prefill.keys, compactLength, cacheCapacity, layers, hidden,
-            session.inputShape("k_cache", cacheElements),
+            session.inputShape("k_cache", layers * cacheCapacity * hidden),
         ).use { keys ->
-            DirectHalfCache(
+            StepCache(
                 environment, prefill.values, compactLength, cacheCapacity, layers, hidden,
-                session.inputShape("v_cache", cacheElements),
+                session.inputShape("v_cache", layers * cacheCapacity * hidden),
             ).use { values ->
                 val generated = IntArray(semanticCapacity)
                 val previous = ArrayList<Int>(promptSemantic.size + semanticCapacity).apply {
@@ -998,7 +1015,10 @@ object QnnV2ppRuntime {
                         logits, previous, random, options, eosToken,
                         excludeEos = iteration < minimumSemanticIterations,
                     )
-                    if (token == eosToken) break
+                    if (token == eosToken) {
+                        Log.i(tag, "t2s eos iteration=${iteration + 1} validLength=$validLength")
+                        break
+                    }
                     generated[iteration] = token
                     validLength++
                     InferenceProgressBus.report(validLength, semanticCapacity)
@@ -1018,27 +1038,32 @@ object QnnV2ppRuntime {
                         half(
                             environment, position, session.inputShape("position_embedding", position.size),
                         ).use { positionTensor ->
-                            half(
-                                environment, writeMask, session.inputShape("write_mask", writeMask.size),
-                            ).use { maskTensor ->
-                                half(
-                                    environment, attentionBias,
-                                    session.inputShape("attention_bias", attentionBias.size),
-                                ).use { biasTensor ->
-                                    session.run(
-                                        mapOf(
-                                            "last_token" to lastToken,
-                                            "position_embedding" to positionTensor,
-                                            "k_cache" to keys.tensor,
-                                            "v_cache" to values.tensor,
-                                            "write_mask" to maskTensor,
-                                            "attention_bias" to biasTensor,
-                                        )
-                                    ).use { outputs ->
-                                        logits = outputs.floats(0)
-                                        if (iteration == 0) Log.i(tag, "step logits ${floatStats(logits)}")
-                                        keys.writeSlot(slot, outputs.half(1))
-                                        values.writeSlot(slot, outputs.half(2))
+                    val bank = iteration and 1
+                    keys.view(environment, bank).use { keyTensor ->
+                        values.view(environment, bank).use { valueTensor ->
+                                    half(
+                                        environment, writeMask, session.inputShape("write_mask", writeMask.size),
+                                    ).use { maskTensor ->
+                                        half(
+                                            environment, attentionBias,
+                                            session.inputShape("attention_bias", attentionBias.size),
+                                        ).use { biasTensor ->
+                                            session.run(
+                                                mapOf(
+                                                    "last_token" to lastToken,
+                                                    "position_embedding" to positionTensor,
+                                                    "k_cache" to keyTensor,
+                                                    "v_cache" to valueTensor,
+                                                    "write_mask" to maskTensor,
+                                                    "attention_bias" to biasTensor,
+                                                )
+                                            ).use { outputs ->
+                                                logits = outputs.floats(0)
+                                                if (iteration == 0) Log.i(tag, "step logits ${floatStats(logits)}")
+                                                keys.writeSlot(slot, outputs.half(1))
+                                                values.writeSlot(slot, outputs.half(2))
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1365,13 +1390,15 @@ object QnnV2ppRuntime {
         sessions: GraphSessionCache? = null,
         progress: ((Int, Int) -> Unit)? = null,
     ): TensorPayload {
-        val values = HashMap(initial)
+        val values = HashMap<String, GraphValue>().apply {
+            initial.forEach { (name, payload) -> put(name, PayloadGraphValue(payload)) }
+        }
         val remainingUses = HashMap<String, Int>()
         stages.flatMap(GraphStage::inputs).forEach { input ->
             remainingUses[input.logicalName] = (remainingUses[input.logicalName] ?: 0) + 1
         }
         stages.forEachIndexed { index, stage ->
-            val runStage: ((OrtSession) -> Map<String, TensorPayload>) -> Map<String, TensorPayload> =
+            val runStage: ((OrtSession) -> Map<String, GraphValue>) -> Map<String, GraphValue> =
                 { block ->
                     if (sessions == null) {
                         withSession(environment, model.runtimeFile(stage.path), stage.name, block = block)
@@ -1382,40 +1409,101 @@ object QnnV2ppRuntime {
             val produced = runStage { session ->
                 validateStageSession(session, stage)
                 val tensors = linkedMapOf<String, OnnxTensor>()
+                var result: OrtSession.Result? = null
+                var resultTransferred = false
                 try {
                     stage.inputs.forEach { contract ->
-                        val payload = requireNotNull(values[contract.logicalName]) {
+                        val value = requireNotNull(values[contract.logicalName]) {
                             "${stage.name} is missing tensor ${contract.logicalName}"
                         }
                         val info = requireNotNull(
                             session.inputInfo[contract.name]?.info as? ai.onnxruntime.TensorInfo
                         )
-                        tensors[contract.name] = payload.tensor(environment, info)
+                        tensors[contract.name] = value.openTensor(environment, info)
                     }
-                    session.run(tensors).use { result ->
-                        val contracts = stage.outputs.associateBy(TensorContract::name)
-                        result.associate { entry ->
-                            val contract = requireNotNull(contracts[entry.key]) {
-                                "${stage.name} returned undeclared tensor ${entry.key}"
-                            }
-                            contract.logicalName to TensorPayload.read(entry.value as OnnxTensor)
+                    result = session.run(tensors)
+                    val contracts = stage.outputs.associateBy(TensorContract::name)
+                    val outputValues = result!!.toList()
+                    val owner = ResultOwner(result!!, outputValues.size)
+                    val produced = outputValues.associate { entry ->
+                        val contract = requireNotNull(contracts[entry.key]) {
+                            "${stage.name} returned undeclared tensor ${entry.key}"
+                        }
+                        contract.logicalName to LiveGraphValue(entry.value as OnnxTensor, owner)
+                    }
+                    resultTransferred = true
+                    produced
+                } finally {
+                    // Inputs created from immutable payloads are owned by this invocation.
+                    // Inter-stage output tensors are owned by ResultOwner and must stay alive.
+                    stage.inputs.forEach { contract ->
+                        val value = values[contract.logicalName]
+                        if (value is PayloadGraphValue) {
+                            tensors[contract.name]?.close()
                         }
                     }
-                } finally {
-                    tensors.values.forEach(OnnxTensor::close)
+                    if (!resultTransferred) result?.close()
                 }
             }
             stage.inputs.forEach { contract ->
                 val remaining = requireNotNull(remainingUses[contract.logicalName]) - 1
                 remainingUses[contract.logicalName] = remaining
                 if (remaining == 0 && contract.logicalName !in produced) {
-                    values.remove(contract.logicalName)
+                    values.remove(contract.logicalName)?.close()
                 }
             }
-            values.putAll(produced)
+            produced.forEach { (name, value) -> values.put(name, value) }
             progress?.invoke(index + 1, stages.size)
         }
-        return requireNotNull(values[outputName]) { "partitioned QNN graph did not produce $outputName" }
+        val output = requireNotNull(values.remove(outputName)) {
+            "partitioned QNN graph did not produce $outputName"
+        }
+        return try {
+            output.read()
+        } finally {
+            output.close()
+            values.values.forEach(GraphValue::close)
+        }
+    }
+
+    private interface GraphValue : AutoCloseable {
+        fun openTensor(environment: OrtEnvironment, info: ai.onnxruntime.TensorInfo): OnnxTensor
+        fun read(): TensorPayload
+    }
+
+    private class PayloadGraphValue(private val payload: TensorPayload) : GraphValue {
+        override fun openTensor(environment: OrtEnvironment, info: ai.onnxruntime.TensorInfo) =
+            payload.tensor(environment, info)
+
+        override fun read(): TensorPayload = payload
+        override fun close() = Unit
+    }
+
+    private class ResultOwner(
+        private val result: OrtSession.Result,
+        count: Int,
+    ) {
+        private var remaining = count
+
+        @Synchronized
+        fun release() {
+            if (remaining > 0 && --remaining == 0) result.close()
+        }
+    }
+
+    private class LiveGraphValue(
+        private val tensor: OnnxTensor,
+        private val owner: ResultOwner,
+    ) : GraphValue {
+        override fun openTensor(environment: OrtEnvironment, info: ai.onnxruntime.TensorInfo): OnnxTensor {
+            require(tensor.info.type == info.type && tensor.info.shape.contentEquals(info.shape)) {
+                "inter-stage tensor contract changed"
+            }
+            return tensor
+        }
+
+        override fun read(): TensorPayload = TensorPayload.read(tensor)
+        override fun close() = owner.release()
     }
 
     /** Retains only one VITS variant per loaded artifact. Debug profiling uses one-shot sessions. */

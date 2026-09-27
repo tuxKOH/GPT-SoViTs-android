@@ -15,8 +15,8 @@ android {
         applicationId = "ai.gsv.mobile"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "3.2.0"
+        versionCode = 9
+        versionName = "3.2.1"
         if (acceptanceAbi != null) {
             ndk { abiFilters += acceptanceAbi }
         }

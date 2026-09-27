@@ -1,4 +1,4 @@
-# GSV Mobile v3.2.0
+# GSV Mobile v3.2.1
 
 <p align="center">
   <img src="docs/gsv-mobile-icon.svg" alt="GSV Mobile 图标" width="132" />
